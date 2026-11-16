@@ -6,16 +6,18 @@
 // ===========================
 // WiFi credentials (2.4 GHz)
 // ===========================
-const char* ssid = "Mustapha00";
+const char* ssid     = "Mustapha00";
 const char* password = "123456789";
+
 // ===========================
-// Tunable settings
+// Heat settings
 // ===========================
-#define STREAM_FRAME_SIZE  FRAMESIZE_VGA     // QVGA for max speed, VGA for detection
-#define JPEG_QUALITY       12                // lower = better quality (10-15 good)
-#define XCLK_FREQ          10000000
-#define FRAME_DELAY_MS     15                // ~20-25 fps cap, keeps the chip cooler
-#define WIFI_TX_POWER      WIFI_POWER_15dBm  // use 19_5dBm if the connection is unstable
+#define XCLK_FREQ          10000000   // 20000000 = faster/hotter, 8000000 = cooler/slower
+#define STREAM_FRAME_SIZE  FRAMESIZE_QVGA
+#define JPEG_QUALITY       12
+#define FRAME_DELAY_MS     40         // ~ caps the fps, lets the sensor rest
+#define LOW_IO_DRIVE       1          // 1 = reduce IO drive (cooler). If image breaks, set to 0
+#define WIFI_TX_POWER      WIFI_POWER_15dBm
 
 // ===========================
 // AI-Thinker ESP32-CAM pins
@@ -38,22 +40,74 @@ const char* password = "123456789";
 #define PCLK_GPIO_NUM     22
 #define FLASH_LED_GPIO     4
 
-httpd_handle_t ctrl_httpd   = NULL;   // port 80: page + commands
-httpd_handle_t stream_httpd = NULL;   // port 81: video stream
+httpd_handle_t ctrl_httpd   = NULL;
+httpd_handle_t stream_httpd = NULL;
 
-// ---------- Drive command (fill in with your motor driver) ----------
-// dir: F = forward, B = back, L = left, R = right, S = stop
-void driveCar(char dir) {
-  Serial.printf("CMD: %c\n", dir);
-  // TODO: set your motor driver pins here (e.g. L298N / TB6612)
+camera_config_t camConfig;
+volatile bool cameraOn = false;
+
+// ---------- Camera on / off ----------
+bool cameraStart() {
+  if (cameraOn) return true;
+  pinMode(PWDN_GPIO_NUM, OUTPUT);
+  digitalWrite(PWDN_GPIO_NUM, LOW);     // wake the sensor
+  delay(50);
+
+  esp_err_t err = esp_camera_init(&camConfig);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed: 0x%x\n", err);
+    return false;
+  }
+  sensor_t *s = esp_camera_sensor_get();
+  Serial.printf("Sensor PID: 0x%x (OV5640 = 0x5640)\n", s->id.PID);
+
+  s->set_framesize(s, STREAM_FRAME_SIZE);
+  s->set_quality(s, JPEG_QUALITY);
+  s->set_whitebal(s, 1);
+  s->set_awb_gain(s, 1);
+  s->set_exposure_ctrl(s, 1);
+  s->set_gain_ctrl(s, 1);
+  s->set_lenc(s, 1);
+  s->set_bpc(s, 1);
+  s->set_wpc(s, 1);
+
+#if LOW_IO_DRIVE
+  // Reported to cut OV5640 heat: lower IO drive strength, bits[7:6] 11 -> 00
+  if (s->id.PID == OV5640_PID) {
+    s->set_reg(s, 0x302C, 0xC0, 0x00);
+    Serial.println("OV5640 IO drive reduced (reg 0x302C)");
+  }
+#endif
+  // s->set_vflip(s, 1);     // uncomment if the image is upside down
+  // s->set_hmirror(s, 1);
+
+  cameraOn = true;
+  return true;
 }
 
-// ---------- Web page ----------
+void cameraStop() {
+  if (!cameraOn) return;
+  esp_camera_deinit();
+  pinMode(PWDN_GPIO_NUM, OUTPUT);
+  digitalWrite(PWDN_GPIO_NUM, HIGH);    // sensor in power-down
+  cameraOn = false;
+  Serial.println("Camera OFF (PWDN high)");
+}
+
+// ---------- Drive command (fill in with your motor driver) ----------
+void driveCar(char dir) {
+  Serial.printf("CMD: %c\n", dir);
+  // TODO: motor driver pins
+}
+
+// ---------- Web handlers ----------
 static esp_err_t index_handler(httpd_req_t *req) {
   const char* html =
     "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<title>ESP32-CAM Car</title></head>"
+    "<title>ESP32-CAM</title></head>"
     "<body style='margin:0;background:#000;color:#0f0;text-align:center;font-family:monospace'>"
+    "<p><a style='color:#0f0' href='/on'>camera ON</a> | <a style='color:#0f0' href='/off'>camera OFF</a> | "
+    "<a style='color:#0f0' href='/status'>status</a></p>"
     "<img id='v' style='max-width:100%;height:auto'>"
     "<script>document.getElementById('v').src='http://'+location.hostname+':81/stream';</script>"
     "</body></html>";
@@ -61,33 +115,39 @@ static esp_err_t index_handler(httpd_req_t *req) {
   return httpd_resp_send(req, html, strlen(html));
 }
 
-// ---------- Status: /status ----------
+static esp_err_t on_handler(httpd_req_t *req) {
+  bool ok = cameraStart();
+  httpd_resp_send(req, ok ? "camera on" : "camera init failed", HTTPD_RESP_USE_STRLEN);
+  return ESP_OK;
+}
+
+static esp_err_t off_handler(httpd_req_t *req) {
+  cameraStop();
+  httpd_resp_send(req, "camera off", HTTPD_RESP_USE_STRLEN);
+  return ESP_OK;
+}
+
 static esp_err_t status_handler(httpd_req_t *req) {
-  char buf[200];
+  char buf[220];
   snprintf(buf, sizeof(buf),
-           "{\"psram\":%s,\"psram_free_kb\":%u,\"rssi\":%d,\"heap_kb\":%u}",
-           psramFound() ? "true" : "false",
-           (unsigned)(ESP.getFreePsram() / 1024),
-           WiFi.RSSI(),
+           "{\"camera\":%s,\"uptime_s\":%lu,\"psram_free_kb\":%u,\"rssi\":%d,\"heap_kb\":%u}",
+           cameraOn ? "true" : "false", millis() / 1000,
+           (unsigned)(ESP.getFreePsram() / 1024), WiFi.RSSI(),
            (unsigned)(ESP.getFreeHeap() / 1024));
   httpd_resp_set_type(req, "application/json");
   return httpd_resp_send(req, buf, strlen(buf));
 }
 
-// ---------- Single frame: /capture ----------
 static esp_err_t capture_handler(httpd_req_t *req) {
+  if (!cameraOn && !cameraStart()) { httpd_resp_send_500(req); return ESP_FAIL; }
   camera_fb_t *fb = esp_camera_fb_get();
-  if (!fb) {
-    httpd_resp_send_500(req);
-    return ESP_FAIL;
-  }
+  if (!fb) { httpd_resp_send_500(req); return ESP_FAIL; }
   httpd_resp_set_type(req, "image/jpeg");
   esp_err_t res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
   esp_camera_fb_return(fb);
   return res;
 }
 
-// ---------- Commands: /cmd?d=F ----------
 static esp_err_t cmd_handler(httpd_req_t *req) {
   char query[32], val[8];
   if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
@@ -100,8 +160,9 @@ static esp_err_t cmd_handler(httpd_req_t *req) {
   return ESP_FAIL;
 }
 
-// ---------- MJPEG stream (port 81) ----------
 static esp_err_t stream_handler(httpd_req_t *req) {
+  if (!cameraOn && !cameraStart()) { httpd_resp_send_500(req); return ESP_FAIL; }
+
   camera_fb_t *fb = NULL;
   esp_err_t res = ESP_OK;
   char part_buf[64];
@@ -111,60 +172,52 @@ static esp_err_t stream_handler(httpd_req_t *req) {
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
 
   int frames = 0;
-  unsigned long lastFpsPrint = millis();
+  unsigned long lastPrint = millis();
 
-  while (true) {
+  while (cameraOn) {
     fb = esp_camera_fb_get();
-    if (!fb) {
-      Serial.println("Camera capture failed");
-      res = ESP_FAIL;
-      break;
-    }
+    if (!fb) { Serial.println("Capture failed"); res = ESP_FAIL; break; }
 
     size_t hlen = snprintf(part_buf, sizeof(part_buf),
-                           "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
-                           (unsigned)fb->len);
-
+                           "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", (unsigned)fb->len);
     res = httpd_resp_send_chunk(req, "--frame\r\n", 9);
     if (res == ESP_OK) res = httpd_resp_send_chunk(req, part_buf, hlen);
     if (res == ESP_OK) res = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
     if (res == ESP_OK) res = httpd_resp_send_chunk(req, "\r\n", 2);
-
+    size_t len = fb->len;
     esp_camera_fb_return(fb);
     fb = NULL;
-
-    if (res != ESP_OK) break;   // client disconnected
+    if (res != ESP_OK) break;   // client left: the sensor goes idle (one buffer mode)
 
     frames++;
-    if (millis() - lastFpsPrint >= 3000) {
-      Serial.printf("FPS: %.1f\n", frames * 1000.0 / (millis() - lastFpsPrint));
+    if (millis() - lastPrint >= 3000) {
+      Serial.printf("FPS: %.1f | last frame: %u KB\n",
+                    frames * 1000.0 / (millis() - lastPrint), (unsigned)(len / 1024));
       frames = 0;
-      lastFpsPrint = millis();
+      lastPrint = millis();
     }
-
     if (FRAME_DELAY_MS > 0) vTaskDelay(pdMS_TO_TICKS(FRAME_DELAY_MS));
   }
   return res;
 }
 
-void startCameraServer() {
+void startServers() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = 80;
   config.stack_size  = 8192;
 
-  httpd_uri_t index_uri   = { "/",        HTTP_GET, index_handler,   NULL };
-  httpd_uri_t status_uri  = { "/status",  HTTP_GET, status_handler,  NULL };
-  httpd_uri_t capture_uri = { "/capture", HTTP_GET, capture_handler, NULL };
-  httpd_uri_t cmd_uri     = { "/cmd",     HTTP_GET, cmd_handler,     NULL };
-
+  httpd_uri_t uris[] = {
+    { "/",        HTTP_GET, index_handler,   NULL },
+    { "/on",      HTTP_GET, on_handler,      NULL },
+    { "/off",     HTTP_GET, off_handler,     NULL },
+    { "/status",  HTTP_GET, status_handler,  NULL },
+    { "/capture", HTTP_GET, capture_handler, NULL },
+    { "/cmd",     HTTP_GET, cmd_handler,     NULL },
+  };
   if (httpd_start(&ctrl_httpd, &config) == ESP_OK) {
-    httpd_register_uri_handler(ctrl_httpd, &index_uri);
-    httpd_register_uri_handler(ctrl_httpd, &status_uri);
-    httpd_register_uri_handler(ctrl_httpd, &capture_uri);
-    httpd_register_uri_handler(ctrl_httpd, &cmd_uri);
+    for (auto &u : uris) httpd_register_uri_handler(ctrl_httpd, &u);
   }
 
-  // Stream server on its own port so it never blocks the commands
   config.server_port += 1;   // 81
   config.ctrl_port   += 1;
   httpd_uri_t stream_uri = { "/stream", HTTP_GET, stream_handler, NULL };
@@ -178,78 +231,48 @@ void setup() {
   Serial.println();
 
   pinMode(FLASH_LED_GPIO, OUTPUT);
-  digitalWrite(FLASH_LED_GPIO, LOW);   // flash LED off
+  digitalWrite(FLASH_LED_GPIO, LOW);
 
-  camera_config_t config;
-  config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer   = LEDC_TIMER_0;
-  config.pin_d0 = Y2_GPIO_NUM;
-  config.pin_d1 = Y3_GPIO_NUM;
-  config.pin_d2 = Y4_GPIO_NUM;
-  config.pin_d3 = Y5_GPIO_NUM;
-  config.pin_d4 = Y6_GPIO_NUM;
-  config.pin_d5 = Y7_GPIO_NUM;
-  config.pin_d6 = Y8_GPIO_NUM;
-  config.pin_d7 = Y9_GPIO_NUM;
-  config.pin_xclk     = XCLK_GPIO_NUM;
-  config.pin_pclk     = PCLK_GPIO_NUM;
-  config.pin_vsync    = VSYNC_GPIO_NUM;
-  config.pin_href     = HREF_GPIO_NUM;
-  config.pin_sccb_sda = SIOD_GPIO_NUM;
-  config.pin_sccb_scl = SIOC_GPIO_NUM;
-  config.pin_pwdn     = PWDN_GPIO_NUM;
-  config.pin_reset    = RESET_GPIO_NUM;
-  config.xclk_freq_hz = XCLK_FREQ;
-  config.pixel_format = PIXFORMAT_JPEG;
-  config.jpeg_quality = JPEG_QUALITY;
+  // Keep the sensor in power-down until we need it
+  pinMode(PWDN_GPIO_NUM, OUTPUT);
+  digitalWrite(PWDN_GPIO_NUM, HIGH);
 
-  if (psramFound()) {
-    Serial.println("PSRAM found");
-    config.frame_size  = FRAMESIZE_UXGA;   // init big, shrink after init
-    config.fb_count    = 2;
-    config.fb_location = CAMERA_FB_IN_PSRAM;
-    config.grab_mode   = CAMERA_GRAB_LATEST;   // always the newest frame
-  } else {
-    Serial.println("WARNING: PSRAM not found! Enable it in Tools -> PSRAM");
-    config.frame_size  = FRAMESIZE_SVGA;
-    config.fb_count    = 1;
-    config.fb_location = CAMERA_FB_IN_DRAM;
-    config.grab_mode   = CAMERA_GRAB_WHEN_EMPTY;
+  camConfig.ledc_channel = LEDC_CHANNEL_0;
+  camConfig.ledc_timer   = LEDC_TIMER_0;
+  camConfig.pin_d0 = Y2_GPIO_NUM;
+  camConfig.pin_d1 = Y3_GPIO_NUM;
+  camConfig.pin_d2 = Y4_GPIO_NUM;
+  camConfig.pin_d3 = Y5_GPIO_NUM;
+  camConfig.pin_d4 = Y6_GPIO_NUM;
+  camConfig.pin_d5 = Y7_GPIO_NUM;
+  camConfig.pin_d6 = Y8_GPIO_NUM;
+  camConfig.pin_d7 = Y9_GPIO_NUM;
+  camConfig.pin_xclk     = XCLK_GPIO_NUM;
+  camConfig.pin_pclk     = PCLK_GPIO_NUM;
+  camConfig.pin_vsync    = VSYNC_GPIO_NUM;
+  camConfig.pin_href     = HREF_GPIO_NUM;
+  camConfig.pin_sccb_sda = SIOD_GPIO_NUM;
+  camConfig.pin_sccb_scl = SIOC_GPIO_NUM;
+  camConfig.pin_pwdn     = PWDN_GPIO_NUM;
+  camConfig.pin_reset    = RESET_GPIO_NUM;
+  camConfig.xclk_freq_hz = XCLK_FREQ;
+  camConfig.pixel_format = PIXFORMAT_JPEG;
+  camConfig.jpeg_quality = JPEG_QUALITY;
+  camConfig.frame_size   = FRAMESIZE_UXGA;      // init big, shrink after init
+  camConfig.fb_location  = CAMERA_FB_IN_PSRAM;
+  camConfig.fb_count     = 1;                   // single buffer = less continuous work
+  camConfig.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
+
+  if (!psramFound()) {
+    Serial.println("WARNING: PSRAM not found! Tools -> PSRAM -> Enabled");
+    camConfig.frame_size  = FRAMESIZE_QVGA;
+    camConfig.fb_location = CAMERA_FB_IN_DRAM;
   }
 
-  esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) {
-    Serial.printf("Camera init failed with error 0x%x\n", err);
-    return;
-  }
-
-  sensor_t *s = esp_camera_sensor_get();
-  Serial.printf("Sensor PID: 0x%x (OV5640 = 0x5640)\n", s->id.PID);
-
-  s->set_framesize(s, psramFound() ? STREAM_FRAME_SIZE : FRAMESIZE_QVGA);
-  s->set_quality(s, JPEG_QUALITY);
-  s->set_whitebal(s, 1);
-  s->set_awb_gain(s, 1);
-  s->set_wb_mode(s, 0);
-  s->set_exposure_ctrl(s, 1);
-  s->set_aec2(s, 1);
-  s->set_gain_ctrl(s, 1);
-  s->set_lenc(s, 1);
-  s->set_bpc(s, 1);
-  s->set_wpc(s, 1);
-  s->set_brightness(s, 1);
-  s->set_saturation(s, 0);
-  s->set_sharpness(s, 1);
-
-  // If the image is upside down or mirrored, uncomment:
-  // s->set_vflip(s, 1);
-  // s->set_hmirror(s, 1);
-
-  // ---------- WiFi ----------
+  // ---------- WiFi (connect BEFORE starting the camera) ----------
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);   // full power while connecting
-
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
   Serial.printf("Connecting to \"%s\"", ssid);
   WiFi.begin(ssid, password);
 
@@ -265,16 +288,22 @@ void setup() {
     }
   }
   Serial.println("\nWiFi connected");
-  WiFi.setTxPower(WIFI_TX_POWER);        // lower power after connecting (less heat)
-  Serial.printf("WiFi signal (RSSI): %d dBm\n", WiFi.RSSI());
+  WiFi.setTxPower(WIFI_TX_POWER);
+  Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
 
-  startCameraServer();
+  startServers();
 
-  Serial.print("Camera Ready! Open http://");
+  Serial.print("Ready: http://");
   Serial.println(WiFi.localIP());
-  Serial.println("Stream: http://<ip>:81/stream   Frame: http://<ip>/capture   Command: http://<ip>/cmd?d=F");
+  Serial.println("Camera is OFF until you open the stream or press 'u'.");
+  Serial.println("Serial commands:  u = camera ON   d = camera OFF");
 }
 
 void loop() {
-  delay(10000);
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'u') { Serial.println(cameraStart() ? "Camera ON" : "Camera failed"); }
+    if (c == 'd') { cameraStop(); }
+  }
+  delay(50);
 }
