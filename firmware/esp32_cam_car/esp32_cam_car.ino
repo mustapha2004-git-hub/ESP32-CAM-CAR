@@ -5,6 +5,8 @@
   - Video stream (MJPEG):  http://<ip>:81/stream
   - Single photo:          http://<ip>/capture
   - Drive command:         http://<ip>/cmd?d=F|B|L|R|S
+  - AI / L298N commands:   http://<ip>/action=FORWARD|BACKWARD|LEFT|RIGHT|STOP   (NEW)
+                           (same URLs as the manual L298N controller; the PC adds &ai=1)
   - Camera on/off:         http://<ip>/on   http://<ip>/off
   - Status (JSON):         http://<ip>/status
 
@@ -42,8 +44,15 @@ const char* password = "123456789";
 #define IMAGE_VFLIP        0          // set to 1 if the image is upside down
 
 // ===========================
-// Motor driver pins (TB6612 / DRV8833, 4 direction pins)
+// Motor driver pins (L298N, 4 direction pins; ENA/ENB jumpers stay ON = full speed)
 // Avoid GPIO 12 (boot strapping) and GPIO 16 (PSRAM).
+//   GPIO 13 -> L298N IN1   (left motor)
+//   GPIO 15 -> L298N IN2   (left motor)
+//   GPIO 14 -> L298N IN3   (right motor)
+//   GPIO  2 -> L298N IN4   (right motor)
+// Same directions as the manual controller:
+//   FORWARD IN1=H IN2=L IN3=H IN4=L | BACKWARD IN1=L IN2=H IN3=L IN4=H
+//   LEFT    IN1=L IN2=H IN3=H IN4=L | RIGHT    IN1=H IN2=L IN3=L IN4=H
 // ===========================
 #define LEFT_IN1    13
 #define LEFT_IN2    15
@@ -221,6 +230,30 @@ static esp_err_t cmd_handler(httpd_req_t *req) {
   return ESP_FAIL;
 }
 
+// ---------------------------------------------------------
+// NEW: AI command -> direction
+// Same URLs as the manual L298N controller:
+//   /action=FORWARD  /action=BACKWARD  /action=LEFT  /action=RIGHT  /action=STOP
+// The PC sends e.g. "/action=LEFT&ai=1" (the &ai=1 part is ignored here).
+// ---------------------------------------------------------
+static esp_err_t action_handler(httpd_req_t *req) {
+  const char *uri = req->uri;
+  char dir = 0;
+  if      (strstr(uri, "/action=FORWARD"))  dir = 'F';
+  else if (strstr(uri, "/action=BACKWARD")) dir = 'B';
+  else if (strstr(uri, "/action=LEFT"))     dir = 'L';
+  else if (strstr(uri, "/action=RIGHT"))    dir = 'R';
+  else if (strstr(uri, "/action=STOP"))     dir = 'S';
+
+  if (!dir) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "use /action=FORWARD|BACKWARD|LEFT|RIGHT|STOP");
+    return ESP_FAIL;
+  }
+  driveCar(dir);
+  httpd_resp_send(req, "OK", 2);
+  return ESP_OK;
+}
+
 static esp_err_t stream_handler(httpd_req_t *req) {
   if (!cameraOn && !cameraStart()) { httpd_resp_send_500(req); return ESP_FAIL; }
 
@@ -274,6 +307,7 @@ void startServers() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = 80;
   config.stack_size  = 8192;
+  config.uri_match_fn = httpd_uri_match_wildcard;   // NEW: lets "/action=*" match "/action=LEFT&ai=1"
 
   httpd_uri_t uris[] = {
     { "/",        HTTP_GET, index_handler,   NULL },
@@ -282,6 +316,7 @@ void startServers() {
     { "/status",  HTTP_GET, status_handler,  NULL },
     { "/capture", HTTP_GET, capture_handler, NULL },
     { "/cmd",     HTTP_GET, cmd_handler,     NULL },
+    { "/action=*", HTTP_GET, action_handler, NULL },   // NEW
   };
   if (httpd_start(&ctrl_httpd, &config) == ESP_OK) {
     for (auto &u : uris) httpd_register_uri_handler(ctrl_httpd, &u);
@@ -376,6 +411,7 @@ void setup() {
   Serial.println(WiFi.localIP());
   Serial.println("Stream:  http://<ip>:81/stream");
   Serial.println("Command: http://<ip>/cmd?d=F|B|L|R|S");
+  Serial.println("AI/L298N: http://<ip>/action=FORWARD|BACKWARD|LEFT|RIGHT|STOP");
   Serial.println("Serial keys: u = camera ON, d = camera OFF");
 }
 
