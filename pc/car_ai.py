@@ -19,7 +19,7 @@ ARRIVED_AREA = 0.06   # marker fraction of the frame at which we stop
 OBSTACLE_THR = 0.10   # fraction of the centre zone covered by objects = blocked
 CONF         = 0.40   # YOLO confidence
 ROI_TOP      = 0.35   # ignore the upper part of the image
-SEARCH_TURN  = "R"    # turn direction when the target is not visible
+SEARCH_TURN  = "F"    # turn direction when the target is not visible
 SMOOTH_N     = 3      # majority vote over the last N decisions (stops are never delayed)
 SIZE         = (320, 240)   # same size as the ESP32-CAM stream
 # ============================================
