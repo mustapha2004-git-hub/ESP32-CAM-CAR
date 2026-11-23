@@ -4,7 +4,7 @@
 
   - Video stream (MJPEG):  http://<ip>:81/stream
   - Single photo:          http://<ip>/capture
-  - Drive command:         http://<ip>/cmd?d=F|B|L|R|S
+  - Drive command:         http://<iAp>/cmd?d=F|B|L|R|S
   - AI / L298N commands:   http://<ip>/action=FORWARD|BACKWARD|LEFT|RIGHT|STOP   (NEW)
                            (same URLs as the manual L298N controller; the PC adds &ai=1)
   - Camera on/off:         http://<ip>/on   http://<ip>/off
@@ -24,8 +24,8 @@
 // ===========================
 // WiFi credentials (2.4 GHz only)
 // ===========================
-const char* ssid     = "Mustapha00";
-const char* password = "123456789";
+const char* ssid     = "Redmi";
+const char* password = "m12345689";
 
 // ===========================
 // Camera / heat settings
