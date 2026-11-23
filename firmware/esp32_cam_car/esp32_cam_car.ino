@@ -30,12 +30,12 @@ const char* password = "m12345689";
 // ===========================
 // Camera / heat settings
 // ===========================
-#define XCLK_FREQ          10000000   // 10 MHz = cooler. Raise to 14-20 MHz for more fps (hotter)
-#define STREAM_FRAME_SIZE  FRAMESIZE_QVGA   // 320x240
-#define JPEG_QUALITY       12         // lower number = better quality
-#define FRAME_DELAY_MS     40         // pause between frames (lets the sensor rest)
+#define XCLK_FREQ          16000000   // 16 MHz for sharper focus, faster exposure & higher FPS (10-15 fps)
+#define STREAM_FRAME_SIZE  FRAMESIZE_QVGA   // 320x240 (optimal for YOLOv8 real-time processing)
+#define JPEG_QUALITY       10         // lower number = crisp cleaner picture with less compression artifacts
+#define FRAME_DELAY_MS     10         // shorter pause = lower stream latency for real-time AI
 #define LOW_IO_DRIVE       1          // 1 = lower OV5640 IO drive (cooler). Set 0 if the image breaks
-#define WIFI_TX_POWER      WIFI_POWER_15dBm   // use 19_5dBm if the link is unstable
+#define WIFI_TX_POWER      WIFI_POWER_19_5dBm // full power for solid, stable video stream throughput
 
 // ===========================
 // Image orientation
@@ -135,13 +135,23 @@ bool cameraStart() {
 
   s->set_framesize(s, STREAM_FRAME_SIZE);
   s->set_quality(s, JPEG_QUALITY);
+  s->set_brightness(s, 1);    // slight boost for dark indoor floors
+  s->set_contrast(s, 1);      // boost edges and object separation
+  s->set_saturation(s, 0);    // natural color saturation
+  s->set_special_effect(s, 0);// no filter
   s->set_whitebal(s, 1);
   s->set_awb_gain(s, 1);
+  s->set_wb_mode(s, 0);       // Auto WB
   s->set_exposure_ctrl(s, 1);
+  s->set_aec2(s, 1);          // Auto exposure DSP calculation
+  s->set_ae_level(s, 0);
   s->set_gain_ctrl(s, 1);
-  s->set_lenc(s, 1);
-  s->set_bpc(s, 1);
-  s->set_wpc(s, 1);
+  s->set_agc_gain(s, 0);
+  s->set_gainceiling(s, (gainceiling_t)2); // limit extreme ISO noise
+  s->set_bpc(s, 1);           // bad pixel correction
+  s->set_wpc(s, 1);           // white pixel correction
+  s->set_raw_gma(s, 1);       // gamma curve
+  s->set_lenc(s, 1);          // lens shading correction
 
   s->set_hmirror(s, IMAGE_HMIRROR);
   s->set_vflip(s, IMAGE_VFLIP);

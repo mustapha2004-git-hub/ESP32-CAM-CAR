@@ -16,12 +16,17 @@ from stream_reader import LatestFrame
 # ================= SETTINGS =================
 TARGET_ID    = 0      # ArUco marker ID placed at point B
 ARRIVED_AREA = 0.06   # marker fraction of the frame at which we stop
-OBSTACLE_THR = 0.10   # fraction of the centre zone covered by objects = blocked
-CONF         = 0.40   # YOLO confidence
-ROI_TOP      = 0.35   # ignore the upper part of the image
+OBSTACLE_THR = 0.12   # fraction of the centre zone covered by objects = blocked (raised from 0.10 to reduce false traps)
+CONF         = 0.28   # YOLO confidence (lowered from 0.40 so real-time low-res objects are readily detected)
+ROI_TOP      = 0.30   # ignore the upper 30% of the image (focus on ground obstacles)
 SEARCH_TURN  = "F"    # turn direction when the target is not visible
 SMOOTH_N     = 3      # majority vote over the last N decisions (stops are never delayed)
 SIZE         = (320, 240)   # same size as the ESP32-CAM stream
+
+# Deadlock recovery settings:
+BLOCKED_COUNT_THR = 4 # consecutive blocked cycles before triggering escape maneuver
+BACKUP_DURATION   = 0.7 # seconds to back up when trapped
+ESCAPE_DURATION   = 0.8 # seconds to turn away into open space
 # ============================================
 
 ACTIONS = {"F": "FORWARD", "B": "BACKWARD", "L": "LEFT", "R": "RIGHT", "S": "STOP"}
@@ -102,6 +107,23 @@ class MotorLink(threading.Thread):
         self.join(timeout=1.5)
 
 
+def enhance_frame(frame):
+    """
+    Applies CLAHE (Contrast Limited Adaptive Histogram Equalization) and unsharp masking
+    to recover crisp edges and object contrast from low-cost OV5640 sensors in low/uneven light.
+    """
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    cl = clahe.apply(l)
+    enhanced_lab = cv2.merge((cl, a, b))
+    enhanced = cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2BGR)
+    # Mild unsharp sharpening for clearer YOLO bounding boxes
+    gaussian = cv2.GaussianBlur(enhanced, (0, 0), 2.0)
+    sharpened = cv2.addWeighted(enhanced, 1.25, gaussian, -0.25, 0)
+    return sharpened
+
+
 # ---------------- vision ----------------
 def zone_scores(frame, results):
     """Fraction of each zone (left, centre, right) covered by detected objects."""
@@ -139,22 +161,65 @@ def find_target(frame):
     return None
 
 
+# State variables for deadlock tracking and escape maneuvers
+blocked_streak = 0
+escape_until = 0.0
+escape_phase = None # 'BACKUP' or 'ESCAPE_TURN'
+escape_turn_dir = 'R'
+
 def decide(frame, results):
     """
-    >>> THIS IS THE FUNCTION THE TEAM IMPROVES <<<
     Input : frame (BGR 320x240), YOLO results
-    Output: (command, state_text, zone_scores)   command is one of F, L, R, S
+    Output: (command, state_text, zone_scores)   command is one of F, B, L, R, S
+    Includes autonomous dead-end escape: when trapped, backs up and pivots away!
     """
+    global blocked_streak, escape_until, escape_phase, escape_turn_dir
     scores = zone_scores(frame, results)
     left, centre, right = scores
     target = find_target(frame)
+    now = time.time()
 
+    # 1. Handle Active Escape Sequence (Never get stuck forever)
+    if now < escape_until:
+        if escape_phase == 'BACKUP':
+            return "B", "ESCAPE_REV", scores
+        elif escape_phase == 'ESCAPE_TURN':
+            return escape_turn_dir, "ESCAPE_TURN", scores
+
+    # Transition from BACKUP to ESCAPE_TURN
+    if escape_phase == 'BACKUP' and now >= escape_until:
+        escape_phase = 'ESCAPE_TURN'
+        escape_until = now + ESCAPE_DURATION
+        return escape_turn_dir, "ESCAPE_TURN", scores
+    elif escape_phase == 'ESCAPE_TURN' and now >= escape_until:
+        escape_phase = None
+        blocked_streak = 0
+
+    # 2. Arrived at Destination
     if target and target[1] > ARRIVED_AREA:
+        blocked_streak = 0
         return "S", "ARRIVED", scores
+
+    # 3. Obstacle Collision Prevention & Escape Triggering
     if centre > OBSTACLE_THR:
         if left > OBSTACLE_THR and right > OBSTACLE_THR:
+            blocked_streak += 1
+            # If blocked repeatedly, initiate autonomous escape sequence:
+            if blocked_streak >= BLOCKED_COUNT_THR:
+                escape_phase = 'BACKUP'
+                escape_until = now + BACKUP_DURATION
+                # Turn toward whichever side had even slightly less density
+                escape_turn_dir = "L" if left < right else "R"
+                return "B", "ESCAPE_REV", scores
             return "S", "BLOCKED", scores
+
+        # One side is freer -> avoid obstacle
+        blocked_streak = max(0, blocked_streak - 1)
         return ("L" if left < right else "R"), "AVOID", scores
+
+    blocked_streak = 0
+
+    # 4. Target Navigation & Alignment
     if target:
         cx = target[0]
         if cx < 0.40:
@@ -162,6 +227,7 @@ def decide(frame, results):
         if cx > 0.60:
             return "R", "ALIGN", scores
         return "F", "GO", scores
+
     return SEARCH_TURN, "SEARCH", scores
 
 
@@ -169,10 +235,10 @@ history = collections.deque(maxlen=SMOOTH_N)
 
 
 def smooth(cmd):
-    """Majority vote to stop L/R flickering. A STOP is applied immediately."""
-    if cmd == "S":
+    """Majority vote to stop L/R flickering. STOP (S) or BACKWARD (B) execute immediately."""
+    if cmd in ("S", "B"):
         history.clear()
-        return "S"
+        return cmd
     history.append(cmd)
     return collections.Counter(history).most_common(1)[0][0]
 
@@ -216,8 +282,10 @@ def main():
                 time.sleep(0.05)
                 continue
 
-            results = model.predict(frame, imgsz=320, conf=CONF, verbose=False)
-            raw_cmd, state, scores = decide(frame, results)
+            # Apply adaptive CLAHE and edge sharpening for low-res/noisy camera streams
+            processed_frame = enhance_frame(frame)
+            results = model.predict(processed_frame, imgsz=320, conf=CONF, verbose=False)
+            raw_cmd, state, scores = decide(processed_frame, results)
             cmd = smooth(raw_cmd)
             if state == "ARRIVED":
                 running = False
@@ -230,8 +298,17 @@ def main():
             cv2.line(frame, (w // 3, 0), (w // 3, h), (255, 255, 0), 1)
             cv2.line(frame, (2 * w // 3, 0), (2 * w // 3, h), (255, 255, 0), 1)
             shown = final if link else cmd
+            # Status colors: Green for normal, Yellow for avoid/align, Orange for escape, Red for blocked
+            hud_color = (0, 255, 0)
+            if "ESCAPE" in state:
+                hud_color = (0, 165, 255) # Orange
+            elif state in ("BLOCKED", "S"):
+                hud_color = (0, 0, 255) # Red
+            elif state in ("AVOID", "ALIGN"):
+                hud_color = (0, 255, 255) # Yellow
+
             cv2.putText(frame, f"{state}  cmd={shown}  run={running}", (5, 15),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, hud_color, 1)
             cv2.putText(frame, "L:%.2f C:%.2f R:%.2f" % tuple(scores), (5, 35),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
             cv2.imshow("car", cv2.resize(frame, None, fx=2, fy=2))
