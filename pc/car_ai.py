@@ -17,7 +17,7 @@ from stream_reader import LatestFrame
 TARGET_ID    = 0      # ArUco marker ID placed at point B
 ARRIVED_AREA = 0.06   # marker fraction of the frame at which we stop
 OBSTACLE_THR = 0.12   # fraction of the centre zone covered by objects = blocked
-CONF         = 0.22   # YOLO confidence (optimal for stable detections without hallucinations)
+CONF         = 0.20   # detection confidence threshold
 ROI_TOP      = 0.35   # ignore the upper 35% of the image (focus on ground obstacles)
 SEARCH_TURN  = "F"    # turn direction when the target is not visible
 SMOOTH_N     = 3      # majority vote over the last N decisions (stops are never delayed)
@@ -31,7 +31,10 @@ ESCAPE_DURATION   = 0.7 # seconds to turn away into open space
 
 ACTIONS = {"F": "FORWARD", "B": "BACKWARD", "L": "LEFT", "R": "RIGHT", "S": "STOP"}
 
-model = YOLO("yolov8n.pt")
+# Load Specialized Indoor Obstacle Detection Model (falls back to yolov8n.pt if not present)
+MODEL_PATH = "yolov8n_indoor.pt" if os.path.exists("yolov8n_indoor.pt") else "yolov8n.pt"
+print(f"[AI] Initializing model: {MODEL_PATH}")
+model = YOLO(MODEL_PATH)
 aruco = cv2.aruco
 detector = aruco.ArucoDetector(aruco.getPredefinedDictionary(aruco.DICT_4X4_50),
                                aruco.DetectorParameters())
@@ -293,9 +296,9 @@ def main():
                 time.sleep(0.05)
                 continue
 
-            # Apply adaptive CLAHE and edge sharpening for low-res/noisy camera streams
+            # Run inference at native frame dimensions for maximum feature preservation
             processed_frame = enhance_frame(frame)
-            results = model.predict(processed_frame, imgsz=320, conf=CONF, verbose=False)
+            results = model.predict(processed_frame, conf=CONF, verbose=False)
             raw_cmd, state, scores = decide(processed_frame, results)
             cmd = smooth(raw_cmd)
             if state == "ARRIVED":
