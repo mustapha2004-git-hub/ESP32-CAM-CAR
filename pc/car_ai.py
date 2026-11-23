@@ -16,24 +16,17 @@ from stream_reader import LatestFrame
 # ================= SETTINGS =================
 TARGET_ID    = 0      # ArUco marker ID placed at point B
 ARRIVED_AREA = 0.06   # marker fraction of the frame at which we stop
-OBSTACLE_THR = 0.15   # fraction of the centre zone covered by objects = blocked
-SIDE_BLOCKED_THR = 0.45 # side zone is only considered genuinely trapped if > 45% filled
-CONF         = 0.15   # YOLO confidence (calibrated for real-time mobile camera stream)
+OBSTACLE_THR = 0.12   # fraction of the centre zone covered by objects = blocked
+CONF         = 0.22   # YOLO confidence (optimal for stable detections without hallucinations)
 ROI_TOP      = 0.35   # ignore the upper 35% of the image (focus on ground obstacles)
 SEARCH_TURN  = "F"    # turn direction when the target is not visible
 SMOOTH_N     = 3      # majority vote over the last N decisions (stops are never delayed)
 SIZE         = (320, 240)   # same size as the ESP32-CAM stream
 
-# Contour / Physical Obstacle Detection (catches blank walls, boxes, legs, and unmodeled obstacles)
-ENABLE_CONTOUR_OBSTACLES = True
-MIN_CONTOUR_AREA         = 550 # filter floor grain, keep substantial physical obstacles
-CANNY_LOW                = 45
-CANNY_HIGH               = 140
-
 # Deadlock recovery settings:
-BLOCKED_COUNT_THR = 4 # consecutive blocked cycles before triggering escape maneuver
-BACKUP_DURATION   = 0.7 # seconds to back up when trapped
-ESCAPE_DURATION   = 0.8 # seconds to turn away into open space
+BLOCKED_COUNT_THR = 5 # consecutive blocked cycles before triggering escape maneuver
+BACKUP_DURATION   = 0.6 # seconds to back up when trapped
+ESCAPE_DURATION   = 0.7 # seconds to turn away into open space
 # ============================================
 
 ACTIONS = {"F": "FORWARD", "B": "BACKWARD", "L": "LEFT", "R": "RIGHT", "S": "STOP"}
@@ -134,50 +127,33 @@ def enhance_frame(frame):
 # ---------------- vision ----------------
 def zone_scores(frame, results):
     """
-    Hybrid Obstacle Scoring:
-    Combines YOLOv8 deep learning detections (people, bottles, cups, chairs)
-    with edge/contour segmentation (detects untextured boxes, plain walls, table legs, barriers).
+    Robust Zone Scoring:
+    Computes fraction of each zone (Left, Center, Right) covered by detected objects.
+    Red boxes denote detected obstacles above the confidence threshold.
     """
     h, w = frame.shape[:2]
     y0 = int(h * ROI_TOP)
     zones = [(0, w // 3), (w // 3, 2 * w // 3), (2 * w // 3, w)]
     scores = [0.0, 0.0, 0.0]
 
-    # 1. YOLO Detections (Red Bounding Boxes)
     for box in results[0].boxes:
         if float(box.conf[0]) < CONF:
             continue
         x1, y1, x2, y2 = map(int, box.xyxy[0])
+        # Only consider objects that reach into the ground/driving field
         y1 = max(y1, y0)
         if y2 <= y1:
             continue
         for i, (zx1, zx2) in enumerate(zones):
             ox = max(0, min(x2, zx2) - max(x1, zx1))
             scores[i] += (ox * (y2 - y1)) / float((zx2 - zx1) * (h - y0))
+        # Draw detected object bounding box and label
+        cls_name = results[0].names[int(box.cls[0])]
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+        cv2.putText(frame, f"{cls_name} {float(box.conf[0]):.2f}", (x1, max(15, y1 - 4)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
 
-    # 2. Contour / Edge Physical Obstacle Detector (Orange Bounding Boxes)
-    # Catches plain walls, boxes, and obstacles not in YOLO's 80 COCO classes
-    if ENABLE_CONTOUR_OBSTACLES:
-        roi = frame[y0:h, 0:w]
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        edges = cv2.Canny(blurred, CANNY_LOW, CANNY_HIGH)
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for c in contours:
-            cx, cy, cw, ch = cv2.boundingRect(c)
-            area = cw * ch
-            # Ignore floor dust and extreme wide horizon lines
-            if area > MIN_CONTOUR_AREA and cw < int(w * 0.80):
-                real_y1 = cy + y0
-                real_y2 = real_y1 + ch
-                for i, (zx1, zx2) in enumerate(zones):
-                    ox = max(0, min(cx + cw, zx2) - max(cx, zx1))
-                    scores[i] += 0.4 * (ox * ch) / float((zx2 - zx1) * (h - y0))
-                cv2.rectangle(frame, (cx, real_y1), (cx + cw, real_y2), (0, 140, 255), 1)
-
-    # Clamp scores to 1.0 maximum
-    scores = [min(1.0, s) for s in scores]
+    scores = [min(1.0, round(s, 3)) for s in scores]
     return scores
 
 
@@ -236,22 +212,20 @@ def decide(frame, results):
         blocked_streak = 0
         return "S", "ARRIVED", scores
 
-    # 3. Obstacle Collision Prevention & Escape Triggering
+    # 3. Obstacle Collision Prevention & Steer Away
     if centre > OBSTACLE_THR:
-        # Genuinely deadlocked only if BOTH left and right sides are heavily impassable
-        if left > SIDE_BLOCKED_THR and right > SIDE_BLOCKED_THR:
+        # If both sides are blocked above threshold, flag as blocked
+        if left > OBSTACLE_THR and right > OBSTACLE_THR:
             blocked_streak += 1
-            # If blocked repeatedly, initiate autonomous escape sequence:
             if blocked_streak >= BLOCKED_COUNT_THR:
                 escape_phase = 'BACKUP'
                 escape_until = now + BACKUP_DURATION
-                # Turn toward whichever side had even slightly less density
                 escape_turn_dir = "L" if left < right else "R"
                 return "B", "ESCAPE_REV", scores
             return "S", "BLOCKED", scores
 
-        # One side is freer -> steer toward the clearer side
-        blocked_streak = max(0, blocked_streak - 1)
+        # One side is freer -> steer toward the freer side
+        blocked_streak = 0
         return ("L" if left < right else "R"), "AVOID", scores
 
     blocked_streak = 0
